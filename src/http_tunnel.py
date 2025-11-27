@@ -1,0 +1,776 @@
+import pandas as pd
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, hour, dayofweek, count, lit, avg, expr, date_format, to_timestamp, lower, udf
+from datetime import datetime
+import os
+import logging
+from https_c2_config_loader import Http_tunnelConfigLoader
+from pyspark.sql.types import StructType, StructField, StringType, LongType, BooleanType
+import json
+import ipaddress
+from pyspark.sql import functions as F
+from pyspark.sql import functions as F
+from pyspark.sql.types import DoubleType, IntegerType
+from pyspark.sql.types import ArrayType, DoubleType, FloatType
+from collections import Counter
+import numpy as np
+import math
+import pickle
+import joblib
+import shutil
+from collections import defaultdict
+import time
+
+# --- Shannon Entropy ---
+def shannon_entropy_py(s):
+    if not s or len(s) == 0:
+        return 0.0
+    p, l = np.array(list(Counter(s).values())), len(s)
+    probs = p / l
+    return float(-np.sum(probs * np.log2(probs)))
+
+
+# --- Unigram Vector (256-dim) ---
+def unigram_vector_py(s):
+    v = np.zeros(256, dtype=float)
+    if s:
+        encoded = s.encode(errors="ignore")
+        total = len(encoded)
+        if total > 0:
+            for b, count in Counter(encoded).items():
+                v[b] = count / total
+    return v.tolist()
+
+
+# --- Flatten list fields ---
+def flatten_list_field_py(x):
+    if isinstance(x, list):
+        return " ".join(map(str, x))
+    elif isinstance(x, str):
+        return x
+    return ""
+
+
+shannon_entropy_udf = F.udf(shannon_entropy_py, DoubleType())
+unigram_vector_udf = F.udf(unigram_vector_py, ArrayType(FloatType()))
+flatten_list_field_udf = F.udf(flatten_list_field_py)
+
+class Http_tunnelParser:
+    def __init__(self):
+
+        #initialize configloader object
+        config_loader_object = Http_tunnelConfigLoader()
+        self.log_file_path, self.http_tunnel_raw_input_dir,self.http_tunnel_preprocessor_input_dir, self.get_model_path, self.threshold, self.alerts_dir = config_loader_object.main()
+        #Setup logging
+        self.logger = config_loader_object.logger
+        self.schema = StructType([
+            StructField("network", StructType([
+                StructField("src_ip", StringType(), True),
+                StructField("dst_ip", StringType(), True)
+            ]), True),
+            StructField("transport", StructType([
+                StructField("src_port", LongType(), True),
+                StructField("dst_port", LongType(), True),
+                StructField("protocol", StringType(), True),
+                StructField("src_flags", StringType(), True),
+                StructField("dst_flags", StringType(), True)
+            ]), True),
+            StructField("session", StructType([
+                StructField("duration", LongType(), True), #in milisec
+                StructField("total_bytes", LongType(), True),
+                StructField("transmitted_bytes", LongType(), True),
+                StructField("received_bytes", LongType(), True),
+                StructField("total_packets", LongType(), True),
+                StructField("transmitted_packets", LongType(), True),
+                StructField("received_packets", LongType(), True),
+
+                StructField("client_max_pkt_size", LongType(), True),
+                StructField("server_max_pkt_size", LongType(), True),
+
+                StructField("client_average_interarrival_time", LongType(), True),
+                StructField("server_average_interarrival_time", LongType(), True),
+                StructField("client_std_dev_interarrival_time", LongType(), True),
+                StructField("server_std_dev_interarrival_time", LongType(), True),
+
+                StructField("client_total_payload_size", LongType(), True),
+                StructField("server_total_payload_size", LongType(), True),
+                StructField("client_nonempty_packet_count", LongType(), True),
+                StructField("server_nonempty_packet_count", LongType(), True),
+                
+                StructField("protocol", StringType(), True),
+                StructField("start_time", LongType(), True),
+                StructField("client_entropy", LongType(), True),
+                StructField("server_entropy", LongType(), True)
+            ]), True),
+            StructField("payload", StructType([
+                StructField("http_host", StringType(), True),
+                StructField("http_get", StringType(), True),
+                StructField("http_content_type", StringType(), True),
+                StructField("user_agent", StringType(), True),
+                StructField("http_server", StringType(), True),
+                StructField("http_content_length", StringType(), True),
+
+            ]), True)
+        ])
+
+
+        self._spark_session = None
+
+    # Create a spark Session 
+    def create_spark_session(self):
+        if not self._spark_session:
+            self._spark_session = SparkSession.builder.appName("HTTP_TUNNEL Parser").getOrCreate()
+        return self._spark_session
+
+    
+    # Preprocessing
+    def extract_features(self):
+        spark = self.create_spark_session()
+        filenames = os.listdir(self.http_tunnel_raw_input_dir)
+        
+        if len(filenames) == 0:
+            self.logger.info("No Files in input Directory. Skipping!")
+            return None, None
+
+        # Move files to temp preprocessing dir
+        os.makedirs(self.http_tunnel_preprocessor_input_dir, exist_ok=True)
+
+        print(f" Moveing parquet files to : {self.http_tunnel_preprocessor_input_dir} ...")
+        self.logger.info(f"Moving parquet files to: {self.http_tunnel_preprocessor_input_dir} ...")
+        moved_files = []
+        for filename in filenames:
+            if not filename.endswith(".parquet"):
+                continue
+
+            full_file_path = os.path.join(self.http_tunnel_raw_input_dir, filename)
+            
+            src = os.path.join(self.http_tunnel_raw_input_dir, filename)
+            dst = os.path.join(self.http_tunnel_preprocessor_input_dir, filename)
+            
+            try:
+                shutil.move(src, dst)  
+                moved_files.append(dst)
+
+            except Exception as e:
+                self.logger.error(f"Failed to move {src} -> {dst}: {e}")
+
+        if not moved_files:
+            self.logger.info("No files moved to temp preprocessing dir. Skipping!")
+            return None, None    
+
+        self.logger.info("Processing perquet files...")
+        df_list = []
+        for filename in moved_files:
+            if not filename.endswith('.parquet'):
+                continue
+
+            full_file_path = os.path.join(self.http_tunnel_preprocessor_input_dir, filename)
+            print(f"Processing file: {full_file_path}")
+            
+            try:
+                df = spark.read.schema(self.schema).parquet(full_file_path)
+                #df = spark.read.parquet(full_file_path)
+                print(f"Read {df.count()} rows from {full_file_path}")
+                df_list.append(df)
+
+            except Exception as e:
+                self.logger.error(f"Error processing file {full_file_path}: {e}")
+
+        if not df_list:
+            self.logger.info("No valid DataFrames created. Skipping!")
+            return None, None
+
+        merged_df = df_list[0]
+        for df in df_list[1:]:
+            merged_df = merged_df.unionAll(df)
+
+        print(f"{merged_df.count()} rows extracted from perquet...")
+        self.logger.info(f"{merged_df.count()} rows extracted from perquet...")
+
+        # Filter HTTP sessions before feature extraction
+        df_filtered = merged_df.filter(
+                (F.lower(F.col("session.protocol")) == "http") 
+            )
+        
+        print(f"{df_filtered.count()} rows after http filtering...")
+        self.logger.info(f"{df_filtered.count()} rows after http filtering...")
+
+
+        # Extract and calculate features
+        df_flat = df_filtered.select(
+            # Basic network information
+            merged_df.network.src_ip.alias("src_ip"),
+            merged_df.network.dst_ip.alias("dst_ip"),
+            merged_df.transport.src_port.cast("int").alias("src_port"),
+            merged_df.transport.dst_port.cast("int").alias("dst_port"),
+            merged_df.transport.protocol.alias("protocol"),
+            
+            # Session duration (miliseconds)
+            (merged_df.session.duration).alias("Flow_Duration"),
+            (merged_df.session.transmitted_packets).alias("Total_Fwd_Packets"),
+            (merged_df.session.received_packets).alias("Total_Backward_Packets"),
+            merged_df.session.transmitted_bytes.alias("Fwd_Packets_Length_Total"),
+            merged_df.session.received_bytes.alias("Bwd_Packets_Length_Total"),
+            merged_df.session.client_max_pkt_size.alias("Fwd_Packet_Length_Max"),
+            merged_df.session.server_max_pkt_size.alias("Bwd_Packet_Length_Max"),
+
+            # --- Mean calculations ---
+            F.when(merged_df.session.transmitted_packets > 0,
+                merged_df.session.transmitted_bytes.cast("double") / merged_df.session.transmitted_packets.cast("double")
+            ).otherwise(0.0).alias("Fwd_Packet_Length_Mean"),
+
+            F.when(merged_df.session.received_packets > 0,
+                merged_df.session.received_bytes.cast("double") / merged_df.session.received_packets.cast("double")
+            ).otherwise(0.0).alias("Bwd_Packet_Length_Mean"),
+            
+
+            # --- Flow statistics ---
+            (merged_df.session.duration / 1000.0).alias("Duration_sec"),
+
+            F.when(merged_df.Duration_sec > 0,
+                merged_df.session.total_bytes.cast("double") / merged_df.Duration_sec
+            ).otherwise(0.0).alias("Flow_Bytes_per_s"),
+
+            F.when(merged_df.Duration_sec > 0,
+                merged_df.session.total_packets.cast("double") / merged_df.Duration_sec
+            ).otherwise(0.0).alias("Flow_Packets_per_s"),
+
+            # --- IAT (Inter-Arrival Time) metrics ---
+            (
+                (
+                    (merged_df.session.transmitted_packets.cast("double") * merged_df.session.client_std_dev_interarrival_time.cast("double")) +
+                    (merged_df.session.received_packets.cast("double") * merged_df.session.server_std_dev_interarrival_time.cast("double"))
+                ) / 2.0
+            ).alias("Flow_IAT_Mean"),
+
+            (
+                (
+                    (merged_df.session.transmitted_packets.cast("double") * merged_df.session.client_average_interarrival_time.cast("double")) +
+                    (merged_df.session.received_packets.cast("double") * merged_df.session.server_average_interarrival_time.cast("double"))
+                ) / 3.0
+            ).alias("Flow_IAT_Std"),
+
+            merged_df.session.client_average_interarrival_time.alias("Fwd_IAT_Mean"),
+            merged_df.session.client_std_dev_interarrival_time.alias("Fwd_IAT_Std"),
+            merged_df.session.server_average_interarrival_time.alias("Bwd_IAT_Mean"),
+            merged_df.session.server_std_dev_interarrival_time.alias("Bwd_IAT_Std"),
+            
+            # --- Directional packet rates ---
+
+            F.when(merged_df.Duration_sec > 0,
+                merged_df.session.transmitted_packets.cast("double") / merged_df.Duration_sec
+            ).otherwise(0.0).alias("Fwd_Packets_per_s"),
+
+            F.when(merged_df.Duration_sec > 0,
+                merged_df.session.received_packets.cast("double") / merged_df.Duration_sec
+            ).otherwise(0.0).alias("Bwd_Packets_per_s"),
+
+
+            # --- Combined packet stats ---
+
+            F.greatest(
+                F.col("session.client_max_pkt_size").cast("double"),
+                F.col("session.server_max_pkt_size").cast("double")
+            ).alias("Packet_Length_Max"),
+
+            F.when(
+                F.col("session.total_packets") > 0,
+                F.col("session.total_bytes").cast("double") / F.col("session.total_packets").cast("double")
+            ).otherwise(0.0).alias("Packet_Length_Mean"),
+
+            F.when(
+                F.col("session.client_nonempty_packet_count") > 0,
+                F.col("session.client_total_payload_size").cast("double") / F.col("session.client_nonempty_packet_count").cast("double")
+            ).otherwise(0.0).alias("client_mean"),
+
+            F.when(
+                F.col("session.server_nonempty_packet_count") > 0,
+                F.col("session.server_total_payload_size").cast("double") / F.col("session.server_nonempty_packet_count").cast("double")
+            ).otherwise(0.0).alias("server_mean")
+
+            # --- Packet variance & std ---
+            (
+                (
+                    ((F.col("client_mean") - F.col("Packet_Length_Mean")) ** 2) +
+                    ((F.col("server_mean") - F.col("Packet_Length_Mean")) ** 2)
+                ) / 2.0
+            ).alias("Packet_Length_Variance"),
+
+            F.sqrt(
+                (
+                    ((F.col("client_mean") - F.col("Packet_Length_Mean")) ** 2) +
+                    ((F.col("server_mean") - F.col("Packet_Length_Mean")) ** 2)
+                ) / 2.0
+            ).alias("Packet_Length_Std"),
+
+            # --- Down/Up ratio ---
+            F.when(F.col("session.transmitted_packets") > 0,
+                F.col("session.received_packets").cast("double") / F.col("session.transmitted_packets")
+            ).otherwise(0.0).alias("Down_Up_Ratio"),
+
+            # --- Average segment sizes ---
+            F.when(F.col("session.total_packets") > 0,
+                F.col("session.total_bytes").cast("double") / F.col("session.total_packets")
+            ).otherwise(0.0).alias("Avg_Packet_Size"),
+
+            F.when(F.col("session.client_nonempty_packet_count") > 0,
+                F.col("session.client_total_payload_size").cast("double") / F.col("session.client_nonempty_packet_count")
+            ).otherwise(0.0).alias("Avg_Fwd_Segment_Size"),
+
+            F.when(F.col("session.server_nonempty_packet_count") > 0,
+                F.col("session.server_total_payload_size").cast("double") / F.col("session.server_nonempty_packet_count")
+            ).otherwise(0.0).alias("Avg_Bwd_Segment_Size"),
+
+            # --- TCP flag counts ---
+            F.when(F.col("transport.src_flags").contains("F"), 1).otherwise(0).alias("Fwd_FIN_Flag_Count"),
+            F.when(F.col("transport.src_flags").contains("S"), 1).otherwise(0).alias("Fwd_SYN_Flag_Count"),
+            F.when(F.col("transport.src_flags").contains("R"), 1).otherwise(0).alias("Fwd_RST_Flag_Count"),
+            F.when(F.col("transport.src_flags").contains("P"), 1).otherwise(0).alias("Fwd_PSH_Flag_Count"),
+            F.when(F.col("transport.src_flags").contains("A"), 1).otherwise(0).alias("Fwd_ACK_Flag_Count"),
+            F.when(F.col("transport.src_flags").contains("U"), 1).otherwise(0).alias("Fwd_URG_Flag_Count"),
+            F.when(F.col("transport.src_flags").contains("C"), 1).otherwise(0).alias("Fwd_CWE_Flag_Count"),
+            F.when(F.col("transport.src_flags").contains("E"), 1).otherwise(0).alias("Fwd_ECE_Flag_Count"),
+
+            F.when(F.col("transport.dst_flags").contains("F"), 1).otherwise(0).alias("Bwd_FIN_Flag_Count"),
+            F.when(F.col("transport.dst_flags").contains("S"), 1).otherwise(0).alias("Bwd_SYN_Flag_Count"),
+            F.when(F.col("transport.dst_flags").contains("R"), 1).otherwise(0).alias("Bwd_RST_Flag_Count"),
+            F.when(F.col("transport.dst_flags").contains("P"), 1).otherwise(0).alias("Bwd_PSH_Flag_Count"),
+            F.when(F.col("transport.dst_flags").contains("A"), 1).otherwise(0).alias("Bwd_ACK_Flag_Count"),
+            F.when(F.col("transport.dst_flags").contains("U"), 1).otherwise(0).alias("Bwd_URG_Flag_Count"),
+            F.when(F.col("transport.dst_flags").contains("C"), 1).otherwise(0).alias("Bwd_CWE_Flag_Count"),
+            F.when(F.col("transport.dst_flags").contains("E"), 1).otherwise(0).alias("Bwd_ECE_Flag_Count"),
+
+            # --- Combined flag counts ---
+            (F.col("Fwd_FIN_Flag_Count") + F.col("Bwd_FIN_Flag_Count")).alias("FIN_Flag_Count"),
+            (F.col("Fwd_SYN_Flag_Count") + F.col("Bwd_SYN_Flag_Count")).alias("SYN_Flag_Count"),
+            (F.col("Fwd_RST_Flag_Count") + F.col("Bwd_RST_Flag_Count")).alias("RST_Flag_Count"),
+            (F.col("Fwd_PSH_Flag_Count") + F.col("Bwd_PSH_Flag_Count")).alias("PSH_Flag_Count"),
+            (F.col("Fwd_ACK_Flag_Count") + F.col("Bwd_ACK_Flag_Count")).alias("ACK_Flag_Count"),
+            (F.col("Fwd_URG_Flag_Count") + F.col("Bwd_URG_Flag_Count")).alias("URG_Flag_Count"),
+            (F.col("Fwd_CWE_Flag_Count") + F.col("Bwd_CWE_Flag_Count")).alias("CWE_Flag_Count"),
+            (F.col("Fwd_ECE_Flag_Count") + F.col("Bwd_ECE_Flag_Count")).alias("ECE_Flag_Count"),
+
+            # --- HTTP entropy ---
+            merged_df.session.client_entropy.alias("request_body_entropy"),
+            merged_df.session.server_entropy.alias("response_body_entropy"),
+
+      
+            # SSL/TLS information
+            merged_df.payload.http_host.alias("http_host"),
+            merged_df.payload.http_get.alias("http_get"),
+            merged_df.payload.http_content_type.alias("http_content_type"),
+            merged_df.payload.user_agent.alias("user_agent"),
+            merged_df.payload.http_server.alias("http_server"),
+            merged_df.payload.http_content_length.alias("http_content_length"),
+
+
+            merged_df.session.start_time.cast("int").alias("start_time")
+        )
+
+        df_flat.printSchema()
+        print(f"{df_flat.count()} rows in after aliasing....")
+        self.logger.info("Schema printed above for df_flat")
+
+        # Parse the http_content_length JSON-like list into array<double>
+        df_flat = df_flat.withColumn(
+            "http_content_length_arr",
+            F.from_json(F.col("http_content_length"), ArrayType(DoubleType()))
+        )
+
+        # Filter out null or empty arrays
+        df_flat = df_flat.withColumn(
+            "http_content_length_arr",
+            F.when(F.size(F.col("http_content_length_arr")) > 0, F.col("http_content_length_arr")).otherwise(F.array())
+        )
+
+        # Compute six statistical features
+        df_flat = (
+            df_flat
+            .withColumn("content_len_min", F.when(F.size(F.col("http_content_length_arr")) > 0, F.array_min("http_content_length_arr")).otherwise(F.lit(0.0)))
+            .withColumn("content_len_max", F.when(F.size(F.col("http_content_length_arr")) > 0, F.array_max("http_content_length_arr")).otherwise(F.lit(0.0)))
+            .withColumn(
+                "content_len_sum",
+                F.aggregate(
+                    F.col("http_content_length_arr"),
+                    F.lit(0.0),
+                    lambda acc, x: acc + x
+                )
+            )
+            .withColumn(
+                "content_len_count",
+                F.size("http_content_length_arr")
+            )
+            .withColumn(
+                "content_len_mean",
+                F.when(F.col("content_len_count") > 0, F.col("content_len_sum") / F.col("content_len_count")).otherwise(0.0)
+            )
+            .withColumn(
+                "content_len_std",
+                F.when(
+                    F.col("content_len_count") > 1,
+                    F.sqrt(
+                        F.aggregate(
+                            F.transform(F.col("http_content_length_arr"), lambda x: (x - F.col("content_len_mean")) ** 2),
+                            F.lit(0.0),
+                            lambda acc, x: acc + x
+                        ) / (F.col("content_len_count") - 1)
+                    )
+                ).otherwise(0.0)
+            )
+        )
+
+        df_flat = df_flat.drop("http_content_length_arr")
+
+        
+        '''
+        # Store sessions in a cumulative CSV for model training
+        output_csv_path = "/home/sudipta/ML_HTTPS_C2/attack_sessions.csv" 
+
+        # Convert Spark DataFrame to Pandas (for CSV append)
+        df_csv = df_flat.toPandas()
+
+        if not os.path.exists(output_csv_path):
+            # First time — create new CSV
+            df_csv.to_csv(output_csv_path, index=False)
+            self.logger.info(f"Created new CSV with {len(df_csv)} sessions: {output_csv_path}")
+        else:
+            # Append new sessions to existing CSV
+            existing_df = pd.read_csv(output_csv_path)
+
+            
+            combined_df = pd.concat([existing_df, df_csv])
+
+            combined_df.to_csv(output_csv_path, index=False)
+            self.logger.info(f"Appended {len(df_csv)} new sessions. Total: {len(combined_df)}")
+        '''  
+        
+        
+        print(f"{df_flat.count()} rows in after encodeing...")
+        #self.logger.info(f"{df_flat.count()} rows in after encodeing...")
+        return df_flat, filenames
+    
+
+    def derive_required_feature(self,df_engineered):
+        features = [
+            "Flow_Duration", "Total_Fwd_Packets", "Total_Backward_Packets",
+            "Fwd_Packets_Length_Total", "Bwd_Packets_Length_Total",
+            "Fwd_Packet_Length_Max", "Bwd_Packet_Length_Max",
+            "Fwd_Packet_Length_Mean", "Bwd_Packet_Length_Mean",
+            "Flow_Bytes_per_s", "Flow_Packets_per_s",
+            "Flow_IAT_Mean", "Flow_IAT_Std", "Fwd_IAT_Mean", "Fwd_IAT_Std",
+            "Bwd_IAT_Mean", "Bwd_IAT_Std",
+            "Fwd_Packets_per_s", "Bwd_Packets_per_s",
+            "Packet_Length_Max", "Packet_Length_Mean", "Packet_Length_Std", "Packet_Length_Variance",
+            "Down_Up_Ratio", "Avg_Packet_Size", "Avg_Fwd_Segment_Size", "Avg_Bwd_Segment_Size",
+
+            "Fwd_PSH_Flag_Count", "Bwd_PSH_Flag_Count", "Fwd_URG_Flag_Count", "Bwd_URG_Flag_Count",
+            "FIN_Flag_Count", "SYN_Flag_Count", "RST_Flag_Count",
+            "PSH_Flag_Count", "ACK_Flag_Count", "URG_Flag_Count",
+            "CWE_Flag_Count", "ECE_Flag_Count", "request_body_entropy", "response_body_entropy",
+
+            "http_host","http_get","http_content_type","user_agent","http_server",
+
+            "content_len_min","content_len_max","content_len_sum","content_len_count","content_len_mean","content_len_std"
+       ]
+
+        # Select only the required features
+        df_final = df_engineered.select(*features)
+        print("Derived only required features...\n")
+        self.logger.info("Derived  required features for Model ...\n")
+        
+        # --- Apply transformations ---
+        text_features = ["http_host", "http_get", "http_content_type", "user_agent", "http_server"]
+
+        for f in text_features:
+            df_final = (
+                df_final
+                .withColumn(f, flatten_list_field_udf(f))
+                .withColumn(f"{f}_len", F.length(F.col(f)))
+                .withColumn(f"{f}_entropy", shannon_entropy_udf(F.col(f)))
+                .withColumn(f"{f}_unigram", unigram_vector_udf(F.col(f)))
+            )
+
+        # --- Expand 256 unigram features  ---
+        for f in text_features:
+            for i in range(256):
+                df_final = df_final.withColumn(f"{f}_u{i}", F.col(f"{f}_unigram")[i]) #like http_host_u0, http_host_u1,......http_host_u255
+
+        # --- Drop intermediate array columns ---
+        for f in text_features:
+            df_final = df_final.drop(f"{f}_unigram")
+
+        df_final = df_final.drop(*text_features)
+
+        print("Added length, entropy, and unigram features for all text fields...")
+        self.logger.info("Added length, entropy, and unigram features for all text fields...\n")
+
+
+        return df_final
+
+    
+
+    def temporal_correlation(self, malicious_sessions):
+        window_sec = 600
+        repeat_threshold = 3
+        confirmed_idx = []
+
+        malicious_sessions = malicious_sessions.copy()
+        malicious_sessions["timestamp"] = malicious_sessions["start_time"] / 1000.0
+        malicious_sessions = malicious_sessions.sort_values("timestamp")
+
+        dst_ip_tracker = defaultdict(list)
+
+        for i, row in malicious_sessions.iterrows():
+            dst = row["dst_ip"]
+            ts = row["timestamp"]
+
+            dst_ip_tracker[dst].append(ts)
+            dst_ip_tracker[dst] = [t for t in dst_ip_tracker[dst] if t >= ts - window_sec]
+
+            if len(dst_ip_tracker[dst]) >= repeat_threshold:
+                confirmed_idx.append(i)
+
+        confirmed_alerts_df = malicious_sessions.loc[confirmed_idx]   
+
+        if not confirmed_alerts_df.empty:
+            print(f"  Confirmed {len(confirmed_alerts_df)} alerts after temporal correlation")
+            self.logger.info(f"  Confirmed {len(confirmed_alerts_df)} alerts after temporal correlation")
+        else:
+            print("  No alerts met temporal correlation criteria")
+            self.logger.info("  No alerts met temporal correlation criteria")
+
+        return confirmed_alerts_df
+      
+
+        
+
+
+    def load_existing_alerts(self):
+        """
+        Load existing alerts from the directory and store the src_ip and dst_ip pairs.
+        Works with JSON alerts saved in alerts_dir.
+        """
+        existing_alerts = set()
+        for filename in os.listdir(self.alerts_dir):
+            if filename.endswith(".json"):
+                file_path = os.path.join(self.alerts_dir, filename)
+                try:
+                    with open(file_path, 'r') as f:
+                        json_data = json.load(f)
+                        src_ip = json_data["match_body"]["network"]["src_ip"]
+                        dst_ip = json_data["match_body"]["network"]["dst_ip"]
+                        existing_alerts.add(f"{src_ip}_{dst_ip}")
+                except Exception as e:
+                    print(f"Error loading existing alert {filename}: {e}")
+                    self.logger.error(f"Error loading existing alert {filename}: {e}")
+        return existing_alerts
+
+    def make_alertgeneration_https_c2(self, malicious_sessions):
+        """
+        Generate alerts from malicious_sessions DataFrame (Pandas).
+        Avoid duplicates using src_ip + dst_ip keys.
+        """
+        #self.logger.info(f"HII am inside alert generation func...")
+        # Load existing alerts to check for duplicates
+        existing_alerts = self.load_existing_alerts()
+
+        for _, row in malicious_sessions.iterrows():
+            src_ip = row["src_ip"]
+            dst_ip = row["dst_ip"]
+            src_port = row["src_port"]
+            dst_port = row["dst_port"]
+
+            # Create unique key
+            unique_key = f"{src_ip}_{dst_ip}"
+            
+            if unique_key in existing_alerts:
+                continue  # Skip if already alerted
+
+            # Build alert JSON
+            json_dict = {
+                "match_body": {
+                    "session": {
+                        "protocol": "http",   # static since filtered already
+                        "session_duration": row["session_duration"],
+                        #"packet_count": row["packet_count"],
+                        #"avg_packet_size": row["avg_packet_size"],
+                        #"download_upload_ratio": row["download_upload_ratio"],
+                        #"sni_entropy": row["sni_entropy"],
+                    },
+                    "network": {
+                        "src_ip": src_ip,
+                        "dst_ip": dst_ip,
+                    },
+                    "transport": {
+                        "src_port": src_port,
+                        "dst_port": dst_port,
+                    },
+                },
+                "score": row["malicious_score"],
+                "rule_name": "ML HTTP_TUNNEL Alert",
+                "alert_type": "http-tunnel",
+                #"severity": 2,
+                "alert_category": "Suspicious tunnelling Anomaly",
+                #"risk_score": 20,
+                "priority": 1,
+                "alert_description": "HTTP tunnel  Anomaly",
+            }
+
+            # Generate unique filename
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+            filename = f"alert-{timestamp}.json"
+            file_path = os.path.join(self.alerts_dir, filename)
+
+
+            try:
+                with open(file_path, "w") as f:
+                    json.dump(json_dict, f, indent=4)
+                    
+            except Exception as e:
+                print(f"Error generating alert {filename}: {e}")
+                self.logger.error(f"Error generating alert {filename}: {e}")
+
+
+            # Add to existing set
+            existing_alerts.add(unique_key)
+
+        print(f"Alerts generated in {self.alerts_dir}")
+        self.logger.info(f"Alerts generated in {self.alerts_dir}")
+    
+    def delete_files(self, filenames):
+        for file in filenames:
+            full_file_path = os.path.join(self.http_tunnel_preprocessor_input_dir, file)
+            if os.path.exists(full_file_path):
+                try:
+                    os.remove(full_file_path)
+                    print(f" Deleted {full_file_path}")
+                    
+                except Exception as e:
+                    print(f" Could not delete {full_file_path}: {e}")
+                    self.logger.error(f" Could not delete {full_file_path}: {e}")
+            else:
+                print(f"File already missing, skipping: {full_file_path}")
+                self.logger.info(f"File already missing, skipping: {full_file_path}")
+
+        self.logger.info(" Deleted perquet files...")    
+
+    def shutdown_spark_session(self):
+        if self._spark_session:
+            self._spark_session.stop()            
+
+
+
+if __name__ == "__main__":
+    http_tunnel_parser = Http_tunnelParser()
+
+    filenames = []
+    try:
+        extracted_data, filenames = http_tunnel_parser.extract_features()
+        
+        if extracted_data is not None:
+            # Deriveing model required features
+            df_final = http_tunnel_parser.derive_required_feature(extracted_data)
+            #df_final.printSchema()
+
+            rows = df_final.count()
+            cols = len(df_final.columns)
+            print(f"df_final shape: ({rows}, {cols})")
+
+            if rows == 0:
+                print("⚠️ No HTTP rows found after feature extraction. Skipping prediction.")
+                http_tunnel_parser.logger.info("⚠️ No HTTP rows found after feature extraction. Skipping prediction.")
+            else:
+                # Converting PySpark DataFrame to Pandas
+                df_pandas = df_final.toPandas()
+                print(f"converted to pandas df...\n")
+                print("df_pandas shape:", df_pandas.shape)
+                http_tunnel_parser.logger.info("converted to pandas df.")
+                
+                # Replace infinities with NaN, then fill NaN with 0
+                X_new = df_pandas.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+                # Loading model and preprocessing pipeline
+                http_tunnel_parser.logger.info("Loading model and preprocessing pipeline.")
+                try:
+                    full_pipeline = joblib.load(http_tunnel_parser.get_model_path)
+                    
+                except FileNotFoundError as e:
+                    print(f" Model not found: {e}")
+                    http_tunnel_parser.logger.error(f" Model not found: {e}")
+                    exit(1)
+                except Exception as e:
+                    print(f" Error loading pipeline: {e}")
+                    http_tunnel_parser.logger.error(f" Error loading pipeline: {e}")
+                    exit(1)
+
+                # MAKE PREDICTIONS
+
+                http_tunnel_parser.logger.info("Start prediction...")
+                try:
+                    y_pred = full_pipeline.predict(X_new)
+                    
+                    if hasattr(full_pipeline, 'predict_proba'):
+                        y_pred_proba = full_pipeline.predict_proba(X_new)
+                        print("Prediction probabilities computed")
+                        http_tunnel_parser.logger.info("Prediction probabilities computed")
+                    else:
+                        y_pred_proba = None
+                        print("  Model doesn't support probability predictions")
+                        http_tunnel_parser.logger.error("Model doesn't support probability predictions")
+                except Exception as e:
+                    print(f" Error during prediction: {e}")
+                    http_tunnel_parser.logger.error(f" Error during prediction: {e}")
+                    exit(1)
+
+                # Add predictions back to extracted_data
+                extracted_data=extracted_data.toPandas()
+                extracted_data = extracted_data.copy()  # to avoid modifying original
+                extracted_data["prediction"] = y_pred # bydefault threshold 0.5
+
+                if y_pred_proba is not None:
+                    # Save probability of "malicious" class (label=1)
+                    extracted_data["malicious_score"] = y_pred_proba[:, 1]
+
+                # Filter only malicious sessions
+                threshold = 0.8
+                malicious_sessions = extracted_data[(extracted_data["malicious_score"] > threshold)]
+                #print(f" Found {len(malicious_sessions)} malicious sessions")
+
+               
+                # temporal correlation of alerts by dst IP
+                if malicious_sessions.empty:
+                    print(" No malicious sessions detected, skipping alert generation...")
+                    http_tunnel_parser.logger.info(" No malicious sessions detected, skipping alert generation...")
+                else:
+                    print(f" Found {len(malicious_sessions)} malicious sessions before temporal filtering")
+                    http_tunnel_parser.logger.info(f" Found {len(malicious_sessions)} malicious sessions before temporal filtering")
+                    malicious_sessions = http_tunnel_parser.temporal_correlation(malicious_sessions)
+                    if malicious_sessions.empty:
+                        print(" No malicious sessions detected,after temporal filtering skipping alert generation...")
+                        http_tunnel_parser.logger.info(" No malicious sessions detected,after temporal filtering skipping alert generation...")
+                    else:
+
+                        # Select only the columns I want to display
+                        display_columns = [
+                            "src_ip","dst_ip","malicious_score"
+                        ]
+
+                        # Keep only the selected columns (ignore if missing)
+                        malicious_info = malicious_sessions[display_columns].copy()
+
+                        # Print  as a table
+                        print("\n=== Malicious Sessions (summary) ===")
+                        print(malicious_info.to_string(index=False))
+                        http_tunnel_parser.logger.info(malicious_info.to_string(index=False))
+                        #https_c2_parser.logger.info(f" Found {len(malicious_sessions)} malicious sessions.")
+
+                        http_tunnel_parser.make_alertgeneration_https_c2(malicious_sessions)
+        else:
+            http_tunnel_parser.logger.info("No Input Data received, skipping!")
+            print("No Input Data received, skipping!")
+    finally:
+        http_tunnel_parser.shutdown_spark_session()
+        if filenames is not None:
+            
+            http_tunnel_parser.delete_files(filenames)
+            

@@ -1,0 +1,14 @@
+{
+    "http_tunnel_raw_input_dir":"/var/log/vehere/dpi/https_c2_input",  
+    "http_tunnel_preprocessor_input_dir":"/usr/local/bin/mlhttp_tunnel/preproc_http_tunnel_input",
+    "http_tunnel_model_path": "/usr/local/bin/mlhttp_tunnel/model/http-tunnel-v1.pkl",
+    "log_file_path":"/var/log/mlanalysis//mlhttp_tunnel.log",
+    "threshold":0.8,
+    "alerts_dir":"/usr/local/bin/mlhttp_tunnel/alerts"
+   
+}
+
+
+
+
+

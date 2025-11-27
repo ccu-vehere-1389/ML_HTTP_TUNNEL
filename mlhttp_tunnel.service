@@ -1,0 +1,14 @@
+[Unit]
+Description=Service for HTTP Tunnel detection using randomforest
+
+[Service]
+Restart=always
+RestartSec=30
+Type=simple
+ExecStart=/usr/local/bin/mlhttp_tunnel/mlhttp_tunnel.sh
+
+[Install]
+WantedBy=multi-user.target
+
+
+
