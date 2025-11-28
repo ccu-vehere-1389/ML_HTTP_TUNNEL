@@ -21,39 +21,10 @@ import shutil
 from collections import defaultdict
 import time
 
-# --- Shannon Entropy ---
-def shannon_entropy_py(s):
-    if not s or len(s) == 0:
-        return 0.0
-    p, l = np.array(list(Counter(s).values())), len(s)
-    probs = p / l
-    return float(-np.sum(probs * np.log2(probs)))
 
 
-# --- Unigram Vector (256-dim) ---
-def unigram_vector_py(s):
-    v = np.zeros(256, dtype=float)
-    if s:
-        encoded = s.encode(errors="ignore")
-        total = len(encoded)
-        if total > 0:
-            for b, count in Counter(encoded).items():
-                v[b] = count / total
-    return v.tolist()
 
 
-# --- Flatten list fields ---
-def flatten_list_field_py(x):
-    if isinstance(x, list):
-        return " ".join(map(str, x))
-    elif isinstance(x, str):
-        return x
-    return ""
-
-
-shannon_entropy_udf = F.udf(shannon_entropy_py, DoubleType())
-unigram_vector_udf = F.udf(unigram_vector_py, ArrayType(FloatType()))
-flatten_list_field_udf = F.udf(flatten_list_field_py)
 
 class Http_tunnelParser:
     def __init__(self):
@@ -209,6 +180,12 @@ class Http_tunnelParser:
             (merged_df.session.duration).alias("Flow_Duration"),
             (merged_df.session.transmitted_packets).alias("Total_Fwd_Packets"),
             (merged_df.session.received_packets).alias("Total_Backward_Packets"),
+
+            F.when(merged_df.session.transmitted_packets > 0,
+                merged_df.session.received_packets.cast("double") / merged_df.session.transmitted_packets.cast("double")
+            ).otherwise(0.0).alias("backward_vs_forward"),
+
+
             merged_df.session.transmitted_bytes.alias("Fwd_Packets_Length_Total"),
             merged_df.session.received_bytes.alias("Bwd_Packets_Length_Total"),
             merged_df.session.client_max_pkt_size.alias("Fwd_Packet_Length_Max"),
@@ -371,56 +348,8 @@ class Http_tunnelParser:
         print(f"{df_flat.count()} rows in after aliasing....")
         self.logger.info("Schema printed above for df_flat")
 
-        # Parse the http_content_length JSON-like list into array<double>
-        df_flat = df_flat.withColumn(
-            "http_content_length_arr",
-            F.from_json(F.col("http_content_length"), ArrayType(DoubleType()))
-        )
 
-        # Filter out null or empty arrays
-        df_flat = df_flat.withColumn(
-            "http_content_length_arr",
-            F.when(F.size(F.col("http_content_length_arr")) > 0, F.col("http_content_length_arr")).otherwise(F.array())
-        )
-
-        # Compute six statistical features
-        df_flat = (
-            df_flat
-            .withColumn("content_len_min", F.when(F.size(F.col("http_content_length_arr")) > 0, F.array_min("http_content_length_arr")).otherwise(F.lit(0.0)))
-            .withColumn("content_len_max", F.when(F.size(F.col("http_content_length_arr")) > 0, F.array_max("http_content_length_arr")).otherwise(F.lit(0.0)))
-            .withColumn(
-                "content_len_sum",
-                F.aggregate(
-                    F.col("http_content_length_arr"),
-                    F.lit(0.0),
-                    lambda acc, x: acc + x
-                )
-            )
-            .withColumn(
-                "content_len_count",
-                F.size("http_content_length_arr")
-            )
-            .withColumn(
-                "content_len_mean",
-                F.when(F.col("content_len_count") > 0, F.col("content_len_sum") / F.col("content_len_count")).otherwise(0.0)
-            )
-            .withColumn(
-                "content_len_std",
-                F.when(
-                    F.col("content_len_count") > 1,
-                    F.sqrt(
-                        F.aggregate(
-                            F.transform(F.col("http_content_length_arr"), lambda x: (x - F.col("content_len_mean")) ** 2),
-                            F.lit(0.0),
-                            lambda acc, x: acc + x
-                        ) / (F.col("content_len_count") - 1)
-                    )
-                ).otherwise(0.0)
-            )
-        )
-
-        df_flat = df_flat.drop("http_content_length_arr")
-
+        
         
         '''
         # Store sessions in a cumulative CSV for model training
@@ -445,32 +374,17 @@ class Http_tunnelParser:
         '''  
         
         
-        print(f"{df_flat.count()} rows in after encodeing...")
-        #self.logger.info(f"{df_flat.count()} rows in after encodeing...")
         return df_flat, filenames
     
 
     def derive_required_feature(self,df_engineered):
         features = [
-            "Flow_Duration", "Total_Fwd_Packets", "Total_Backward_Packets",
-            "Fwd_Packets_Length_Total", "Bwd_Packets_Length_Total",
-            "Fwd_Packet_Length_Max", "Bwd_Packet_Length_Max",
-            "Fwd_Packet_Length_Mean", "Bwd_Packet_Length_Mean",
-            "Flow_Bytes_per_s", "Flow_Packets_per_s",
-            "Flow_IAT_Mean", "Flow_IAT_Std", "Fwd_IAT_Mean", "Fwd_IAT_Std",
-            "Bwd_IAT_Mean", "Bwd_IAT_Std",
-            "Fwd_Packets_per_s", "Bwd_Packets_per_s",
-            "Packet_Length_Max", "Packet_Length_Mean", "Packet_Length_Std", "Packet_Length_Variance",
-            "Down_Up_Ratio", "Avg_Packet_Size", "Avg_Fwd_Segment_Size", "Avg_Bwd_Segment_Size",
-
-            "Fwd_PSH_Flag_Count", "Bwd_PSH_Flag_Count", "Fwd_URG_Flag_Count", "Bwd_URG_Flag_Count",
-            "FIN_Flag_Count", "SYN_Flag_Count", "RST_Flag_Count",
-            "PSH_Flag_Count", "ACK_Flag_Count", "URG_Flag_Count",
-            "CWE_Flag_Count", "ECE_Flag_Count", "request_body_entropy", "response_body_entropy",
-
-            "http_host","http_get","http_content_type","user_agent","http_server",
-
-            "content_len_min","content_len_max","content_len_sum","content_len_count","content_len_mean","content_len_std"
+             "Flow_Duration", "Total_Fwd_Packets", "Total_Backward_Packets","backward_vs_forward",
+            "Bwd_Packets_Length_Total", "Bwd_Packet_Length_Max",
+            "Bwd_Packet_Length_Mean", "Flow_Bytes_per_s",
+            "Flow_IAT_Mean", "Fwd_IAT_Mean", "Bwd_Packets_per_s",
+            "Packet_Length_Mean", "Packet_Length_Variance",
+            "Down_Up_Ratio", "Avg_Bwd_Segment_Size"
        ]
 
         # Select only the required features
@@ -478,32 +392,6 @@ class Http_tunnelParser:
         print("Derived only required features...\n")
         self.logger.info("Derived  required features for Model ...\n")
         
-        # --- Apply transformations ---
-        text_features = ["http_host", "http_get", "http_content_type", "user_agent", "http_server"]
-
-        for f in text_features:
-            df_final = (
-                df_final
-                .withColumn(f, flatten_list_field_udf(f))
-                .withColumn(f"{f}_len", F.length(F.col(f)))
-                .withColumn(f"{f}_entropy", shannon_entropy_udf(F.col(f)))
-                .withColumn(f"{f}_unigram", unigram_vector_udf(F.col(f)))
-            )
-
-        # --- Expand 256 unigram features  ---
-        for f in text_features:
-            for i in range(256):
-                df_final = df_final.withColumn(f"{f}_u{i}", F.col(f"{f}_unigram")[i]) #like http_host_u0, http_host_u1,......http_host_u255
-
-        # --- Drop intermediate array columns ---
-        for f in text_features:
-            df_final = df_final.drop(f"{f}_unigram")
-
-        df_final = df_final.drop(*text_features)
-
-        print("Added length, entropy, and unigram features for all text fields...")
-        self.logger.info("Added length, entropy, and unigram features for all text fields...\n")
-
 
         return df_final
 
@@ -565,7 +453,7 @@ class Http_tunnelParser:
                     self.logger.error(f"Error loading existing alert {filename}: {e}")
         return existing_alerts
 
-    def make_alertgeneration_https_c2(self, malicious_sessions):
+    def make_alertgeneration_http_tunnel(self, malicious_sessions):
         """
         Generate alerts from malicious_sessions DataFrame (Pandas).
         Avoid duplicates using src_ip + dst_ip keys.
@@ -764,7 +652,7 @@ if __name__ == "__main__":
                         http_tunnel_parser.logger.info(malicious_info.to_string(index=False))
                         #https_c2_parser.logger.info(f" Found {len(malicious_sessions)} malicious sessions.")
 
-                        http_tunnel_parser.make_alertgeneration_https_c2(malicious_sessions)
+                        http_tunnel_parser.make_alertgeneration_http_tunnel(malicious_sessions)
         else:
             http_tunnel_parser.logger.info("No Input Data received, skipping!")
             print("No Input Data received, skipping!")
