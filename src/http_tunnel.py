@@ -176,7 +176,6 @@ class Http_tunnelParser:
             F.col("transport.dst_port").cast("int").alias("dst_port"),
             F.col("transport.protocol").alias("protocol"),
             
-<<<<<<< HEAD
             # Session duration (milliseconds)
             F.col("session.duration").alias("Flow_Duration"),
             F.col("session.transmitted_packets").alias("Total_Fwd_Packets"),
@@ -190,22 +189,6 @@ class Http_tunnelParser:
             F.col("session.received_bytes").alias("Bwd_Packets_Length_Total"),
             F.col("session.client_max_pkt_size").alias("Fwd_Packet_Length_Max"),
             F.col("session.server_max_pkt_size").alias("Bwd_Packet_Length_Max"),
-=======
-            # Session duration (miliseconds)
-            (merged_df.session.duration).alias("Flow_Duration"),
-            (merged_df.session.transmitted_packets).alias("Total_Fwd_Packets"),
-            (merged_df.session.received_packets).alias("Total_Backward_Packets"),
-
-            F.when(merged_df.session.transmitted_packets > 0,
-                merged_df.session.received_packets.cast("double") / merged_df.session.transmitted_packets.cast("double")
-            ).otherwise(0.0).alias("backward_vs_forward"),
-
-
-            merged_df.session.transmitted_bytes.alias("Fwd_Packets_Length_Total"),
-            merged_df.session.received_bytes.alias("Bwd_Packets_Length_Total"),
-            merged_df.session.client_max_pkt_size.alias("Fwd_Packet_Length_Max"),
-            merged_df.session.server_max_pkt_size.alias("Bwd_Packet_Length_Max"),
->>>>>>> 09b6e1cfdc5446b93d22efa26bb1698e0fffc7b2
 
             # --- Mean calculations ---
             F.when(F.col("session.transmitted_packets") > 0,
@@ -313,7 +296,6 @@ class Http_tunnelParser:
                 ) / 2.0
             ).alias("Packet_Length_Variance"),
 
-<<<<<<< HEAD
             F.sqrt(
                 (
                     ((F.col("client_mean") - F.col("Packet_Length_Mean")) ** 2) +
@@ -326,8 +308,6 @@ class Http_tunnelParser:
         self.logger.info("Feature engineering completed")
 
         return df_flat, filenames
-=======
->>>>>>> 09b6e1cfdc5446b93d22efa26bb1698e0fffc7b2
 
         
         
@@ -354,11 +334,7 @@ class Http_tunnelParser:
         '''  
         
         
-<<<<<<< HEAD
         
-=======
-        return df_flat, filenames
->>>>>>> 09b6e1cfdc5446b93d22efa26bb1698e0fffc7b2
     
 
     def derive_required_feature(self,df_engineered):
