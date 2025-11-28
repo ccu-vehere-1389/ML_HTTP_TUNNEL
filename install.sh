@@ -19,9 +19,7 @@ mkdir -p $log_dir
 log_file=$log_dir/mlhttp_tunnel.log
 touch $log_file
 
-#mkdir -p /usr/local/bin/mlhttps_c2/alerts
-#mkdir -p /usr/local/bin/mlhttps_c2/model
-#mkdir -p /var/log/vehere/mlhttps_c2-alerts
+
 
 cd /home/sudipta/ML_HTTP_TUNNEL
 cp src/*.py $bin_path
