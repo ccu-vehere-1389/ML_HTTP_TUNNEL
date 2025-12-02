@@ -160,7 +160,7 @@ class Http_tunnelParser:
 
         # Filter HTTP sessions before feature extraction
         df_filtered = merged_df.filter(
-                (F.lower(F.col("session.protocol")) == "http") 
+                 F.lower(F.col("session.protocol")).isin("http", "http-alt") 
             )
         
         print(f"{df_filtered.count()} rows after http filtering...")
@@ -390,7 +390,6 @@ class Http_tunnelParser:
         return confirmed_alerts_df
       
 
-        
 
 
     def load_existing_alerts(self):
@@ -421,7 +420,7 @@ class Http_tunnelParser:
         #self.logger.info(f"HII am inside alert generation func...")
         # Load existing alerts to check for duplicates
         existing_alerts = self.load_existing_alerts()
-
+        
         for _, row in malicious_sessions.iterrows():
             src_ip = row["src_ip"]
             dst_ip = row["dst_ip"]
@@ -439,11 +438,8 @@ class Http_tunnelParser:
                 "match_body": {
                     "session": {
                         "protocol": "http",   # static since filtered already
-                        "session_duration": row["session_duration"],
-                        #"packet_count": row["packet_count"],
-                        #"avg_packet_size": row["avg_packet_size"],
-                        #"download_upload_ratio": row["download_upload_ratio"],
-                        #"sni_entropy": row["sni_entropy"],
+                        "session_duration": row["Flow_Duration"],
+
                     },
                     "network": {
                         "src_ip": src_ip,
@@ -461,12 +457,13 @@ class Http_tunnelParser:
                 "alert_category": "Suspicious tunnelling Anomaly",
                 #"risk_score": 20,
                 "priority": 1,
-                "alert_description": "HTTP tunnel  Anomaly",
+                "alert_description": "HTTP tunnel Anomaly",
             }
 
             # Generate unique filename
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
             filename = f"alert-{timestamp}.json"
+            
             file_path = os.path.join(self.alerts_dir, filename)
 
 
@@ -481,7 +478,8 @@ class Http_tunnelParser:
 
             # Add to existing set
             existing_alerts.add(unique_key)
-
+            self.logger.info(f"Aadded")
+    
         print(f"Alerts generated in {self.alerts_dir}")
         self.logger.info(f"Alerts generated in {self.alerts_dir}")
     
@@ -592,7 +590,7 @@ if __name__ == "__main__":
                 else:
                     print(f" Found {len(malicious_sessions)} malicious sessions before temporal filtering")
                     http_tunnel_parser.logger.info(f" Found {len(malicious_sessions)} malicious sessions before temporal filtering")
-                    malicious_sessions = http_tunnel_parser.temporal_correlation(malicious_sessions)
+                    #malicious_sessions = http_tunnel_parser.temporal_correlation(malicious_sessions)
                     if malicious_sessions.empty:
                         print(" No malicious sessions detected,after temporal filtering skipping alert generation...")
                         http_tunnel_parser.logger.info(" No malicious sessions detected,after temporal filtering skipping alert generation...")

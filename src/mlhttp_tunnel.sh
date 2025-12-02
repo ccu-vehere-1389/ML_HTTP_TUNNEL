@@ -37,6 +37,8 @@ while true; do
         --conf spark.executor.cores=4 \
         "$HTTP_TUNNEL_SCRIPT"
 
+    #"$SPARK_SUBMIT" "$HTTPS_C2_SCRIPT"
+    #python3 $HTTPS_C2_SCRIPT
     sleep $AGGREGATION_TIME_INTERVAL
     find "$alert_input_dir" -type f -newer "$alerts_marker_file" -exec cp {} "$alert_logstash_path" \;
     find "$alert_input_dir" -name "*.json" -mmin +"$alerts_window_mins" -exec rm -f {} \;
