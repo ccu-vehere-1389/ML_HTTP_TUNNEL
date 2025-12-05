@@ -31,7 +31,7 @@ class Http_tunnelParser:
 
         #initialize configloader object
         config_loader_object = Http_tunnelConfigLoader()
-        self.log_file_path, self.http_tunnel_raw_input_dir,self.http_tunnel_preprocessor_input_dir, self.get_model_path, self.threshold, self.alerts_dir = config_loader_object.main()
+        self.log_file_path, self.http_tunnel_preprocessor_input_dir, self.get_model_path, self.threshold, self.alerts_dir = config_loader_object.main()
         #Setup logging
         self.logger = config_loader_object.logger
         self.schema = StructType([
@@ -73,15 +73,7 @@ class Http_tunnelParser:
                 StructField("client_entropy", LongType(), True),
                 StructField("server_entropy", LongType(), True)
             ]), True),
-            StructField("payload", StructType([
-                StructField("http_host", StringType(), True),
-                StructField("http_get", StringType(), True),
-                StructField("http_content_type", StringType(), True),
-                StructField("user_agent", StringType(), True),
-                StructField("http_server", StringType(), True),
-                StructField("http_content_length", StringType(), True),
-
-            ]), True)
+        
         ])
 
 
@@ -97,12 +89,12 @@ class Http_tunnelParser:
     # Preprocessing
     def extract_features(self):
         spark = self.create_spark_session()
-        filenames = os.listdir(self.http_tunnel_raw_input_dir)
+        filenames = os.listdir(self.http_tunnel_preprocessor_input_dir)
         
         if len(filenames) == 0:
             self.logger.info("No Files in input Directory. Skipping!")
             return None, None
-
+        '''
         # Move files to temp preprocessing dir
         os.makedirs(self.http_tunnel_preprocessor_input_dir, exist_ok=True)
 
@@ -128,16 +120,16 @@ class Http_tunnelParser:
         if not moved_files:
             self.logger.info("No files moved to temp preprocessing dir. Skipping!")
             return None, None    
-
-        self.logger.info("Processing perquet files...")
+        '''
+        self.logger.info("Processing perquet files....")
         df_list = []
-        for filename in moved_files:
+        for filename in filenames:
             if not filename.endswith('.parquet'):
                 continue
 
             full_file_path = os.path.join(self.http_tunnel_preprocessor_input_dir, filename)
             print(f"Processing file: {full_file_path}")
-            
+            self.logger.info(f"Processing file: {full_file_path}")
             try:
                 df = spark.read.schema(self.schema).parquet(full_file_path)
                 #df = spark.read.parquet(full_file_path)
@@ -185,15 +177,12 @@ class Http_tunnelParser:
                 F.col("session.received_packets").cast("double") / F.col("session.transmitted_packets").cast("double")
             ).otherwise(0.0).alias("backward_vs_forward"),
 
-            F.col("session.transmitted_bytes").alias("Fwd_Packets_Length_Total"),
+        
             F.col("session.received_bytes").alias("Bwd_Packets_Length_Total"),
-            F.col("session.client_max_pkt_size").alias("Fwd_Packet_Length_Max"),
             F.col("session.server_max_pkt_size").alias("Bwd_Packet_Length_Max"),
 
             # --- Mean calculations ---
-            F.when(F.col("session.transmitted_packets") > 0,
-                F.col("session.transmitted_bytes").cast("double") / F.col("session.transmitted_packets").cast("double")
-            ).otherwise(0.0).alias("Fwd_Packet_Length_Mean"),
+
 
             F.when(F.col("session.received_packets") > 0,
                 F.col("session.received_bytes").cast("double") / F.col("session.received_packets").cast("double")
@@ -204,9 +193,7 @@ class Http_tunnelParser:
                 F.col("session.total_bytes").cast("double") / (F.col("session.duration") / 1000.0)
             ).otherwise(0.0).alias("Flow_Bytes_per_s"),
 
-            F.when((F.col("session.duration") / 1000.0) > 0,
-                F.col("session.total_packets").cast("double") / (F.col("session.duration") / 1000.0)
-            ).otherwise(0.0).alias("Flow_Packets_per_s"),
+
 
             # --- IAT (Inter-Arrival Time) metrics ---
             (
@@ -216,32 +203,21 @@ class Http_tunnelParser:
                 ) / 2.0
             ).alias("Flow_IAT_Mean"),
 
-            (
-                (
-                    (F.col("session.transmitted_packets").cast("double") * F.col("session.client_average_interarrival_time").cast("double")) +
-                    (F.col("session.received_packets").cast("double") * F.col("session.server_average_interarrival_time").cast("double"))
-                ) / 3.0
-            ).alias("Flow_IAT_Std"),
+            
 
             F.col("session.client_average_interarrival_time").alias("Fwd_IAT_Mean"),
-            F.col("session.client_std_dev_interarrival_time").alias("Fwd_IAT_Std"),
-            F.col("session.server_average_interarrival_time").alias("Bwd_IAT_Mean"),
-            F.col("session.server_std_dev_interarrival_time").alias("Bwd_IAT_Std"),
+            
+        
             
             # --- Directional packet rates ---
-            F.when((F.col("session.duration") / 1000.0) > 0,
-                F.col("session.transmitted_packets").cast("double") / (F.col("session.duration") / 1000.0)
-            ).otherwise(0.0).alias("Fwd_Packets_per_s"),
+
 
             F.when((F.col("session.duration") / 1000.0) > 0,
                 F.col("session.received_packets").cast("double") / (F.col("session.duration") / 1000.0)
             ).otherwise(0.0).alias("Bwd_Packets_per_s"),
 
             # --- Combined packet stats ---
-            F.greatest(
-                F.col("session.client_max_pkt_size").cast("double"),
-                F.col("session.server_max_pkt_size").cast("double")
-            ).alias("Packet_Length_Max"),
+
 
             F.when(
                 F.col("session.total_packets") > 0,
@@ -265,21 +241,14 @@ class Http_tunnelParser:
             ).otherwise(0.0).alias("Down_Up_Ratio"),
 
             # --- Average segment sizes ---
-            F.when(F.col("session.total_packets") > 0,
-                F.col("session.total_bytes").cast("double") / F.col("session.total_packets")
-            ).otherwise(0.0).alias("Avg_Packet_Size"),
-
-            F.when(F.col("session.client_nonempty_packet_count") > 0,
-                F.col("session.client_total_payload_size").cast("double") / F.col("session.client_nonempty_packet_count")
-            ).otherwise(0.0).alias("Avg_Fwd_Segment_Size"),
 
             F.when(F.col("session.server_nonempty_packet_count") > 0,
                 F.col("session.server_total_payload_size").cast("double") / F.col("session.server_nonempty_packet_count")
             ).otherwise(0.0).alias("Avg_Bwd_Segment_Size"),
 
             # --- HTTP entropy ---
-            F.col("session.client_entropy").alias("request_body_entropy"),
-            F.col("session.server_entropy").alias("response_body_entropy"),
+            #F.col("session.client_entropy").alias("request_body_entropy"),
+            #F.col("session.server_entropy").alias("response_body_entropy"),
 
             F.col("session.start_time").cast("int").alias("start_time")
         )
@@ -296,12 +265,7 @@ class Http_tunnelParser:
                 ) / 2.0
             ).alias("Packet_Length_Variance"),
 
-            F.sqrt(
-                (
-                    ((F.col("client_mean") - F.col("Packet_Length_Mean")) ** 2) +
-                    ((F.col("server_mean") - F.col("Packet_Length_Mean")) ** 2)
-                ) / 2.0
-            ).alias("Packet_Length_Std")
+
         )
 
         print(f"{df_flat.count()} rows after feature engineering....")
@@ -309,32 +273,6 @@ class Http_tunnelParser:
 
         return df_flat, filenames
 
-        
-        
-        '''
-        # Store sessions in a cumulative CSV for model training
-        output_csv_path = "/home/sudipta/ML_HTTPS_C2/attack_sessions.csv" 
-
-        # Convert Spark DataFrame to Pandas (for CSV append)
-        df_csv = df_flat.toPandas()
-
-        if not os.path.exists(output_csv_path):
-            # First time — create new CSV
-            df_csv.to_csv(output_csv_path, index=False)
-            self.logger.info(f"Created new CSV with {len(df_csv)} sessions: {output_csv_path}")
-        else:
-            # Append new sessions to existing CSV
-            existing_df = pd.read_csv(output_csv_path)
-
-            
-            combined_df = pd.concat([existing_df, df_csv])
-
-            combined_df.to_csv(output_csv_path, index=False)
-            self.logger.info(f"Appended {len(df_csv)} new sessions. Total: {len(combined_df)}")
-        '''  
-        
-        
-        
     
 
     def derive_required_feature(self,df_engineered):
@@ -478,7 +416,7 @@ class Http_tunnelParser:
 
             # Add to existing set
             existing_alerts.add(unique_key)
-            self.logger.info(f"Aadded")
+            #self.logger.info(f"Aadded")
     
         print(f"Alerts generated in {self.alerts_dir}")
         self.logger.info(f"Alerts generated in {self.alerts_dir}")
@@ -509,114 +447,124 @@ class Http_tunnelParser:
 if __name__ == "__main__":
     http_tunnel_parser = Http_tunnelParser()
 
-    filenames = []
     try:
-        extracted_data, filenames = http_tunnel_parser.extract_features()
-        
-        if extracted_data is not None:
-            # Deriveing model required features
-            df_final = http_tunnel_parser.derive_required_feature(extracted_data)
-            #df_final.printSchema()
+        while True:
 
-            rows = df_final.count()
-            cols = len(df_final.columns)
-            print(f"df_final shape: ({rows}, {cols})")
-
-            if rows == 0:
-                print("⚠️ No HTTP rows found after feature extraction. Skipping prediction.")
-                http_tunnel_parser.logger.info("⚠️ No HTTP rows found after feature extraction. Skipping prediction.")
-            else:
-                # Converting PySpark DataFrame to Pandas
-                df_pandas = df_final.toPandas()
-                print(f"converted to pandas df...\n")
-                print("df_pandas shape:", df_pandas.shape)
-                http_tunnel_parser.logger.info("converted to pandas df.")
+            filenames = []
+            try:
+                extracted_data, filenames = http_tunnel_parser.extract_features()
                 
-                # Replace infinities with NaN, then fill NaN with 0
-                X_new = df_pandas.replace([np.inf, -np.inf], np.nan).fillna(0)
+                if extracted_data is not None:
+                    # Deriveing model required features
+                    df_final = http_tunnel_parser.derive_required_feature(extracted_data)
+                    #df_final.printSchema()
 
-                # Loading model and preprocessing pipeline
-                http_tunnel_parser.logger.info("Loading model and preprocessing pipeline.")
-                try:
-                    full_pipeline = joblib.load(http_tunnel_parser.get_model_path)
-                    
-                except FileNotFoundError as e:
-                    print(f" Model not found: {e}")
-                    http_tunnel_parser.logger.error(f" Model not found: {e}")
-                    exit(1)
-                except Exception as e:
-                    print(f" Error loading pipeline: {e}")
-                    http_tunnel_parser.logger.error(f" Error loading pipeline: {e}")
-                    exit(1)
+                    rows = df_final.count()
+                    cols = len(df_final.columns)
+                    print(f"df_final shape: ({rows}, {cols})")
 
-                # MAKE PREDICTIONS
-
-                http_tunnel_parser.logger.info("Start prediction...")
-                try:
-                    y_pred = full_pipeline.predict(X_new)
-                    
-                    if hasattr(full_pipeline, 'predict_proba'):
-                        y_pred_proba = full_pipeline.predict_proba(X_new)
-                        print("Prediction probabilities computed")
-                        http_tunnel_parser.logger.info("Prediction probabilities computed")
+                    if rows == 0:
+                        print(" No HTTP rows found after feature extraction. Skipping prediction.")
+                        http_tunnel_parser.logger.info(" No HTTP rows found after feature extraction. Skipping prediction.")
                     else:
-                        y_pred_proba = None
-                        print("  Model doesn't support probability predictions")
-                        http_tunnel_parser.logger.error("Model doesn't support probability predictions")
-                except Exception as e:
-                    print(f" Error during prediction: {e}")
-                    http_tunnel_parser.logger.error(f" Error during prediction: {e}")
-                    exit(1)
+                        # Converting PySpark DataFrame to Pandas
+                        df_pandas = df_final.toPandas()
+                        print(f"converted to pandas df...\n")
+                        print("df_pandas shape:", df_pandas.shape)
+                        http_tunnel_parser.logger.info("converted to pandas df.")
+                        
+                        # Replace infinities with NaN, then fill NaN with 0
+                        X_new = df_pandas.replace([np.inf, -np.inf], np.nan).fillna(0)
 
-                # Add predictions back to extracted_data
-                extracted_data=extracted_data.toPandas()
-                extracted_data = extracted_data.copy()  # to avoid modifying original
-                extracted_data["prediction"] = y_pred # bydefault threshold 0.5
+                        # Loading model and preprocessing pipeline
+                        http_tunnel_parser.logger.info("Loading model and preprocessing pipeline.")
+                        try:
+                            full_pipeline = joblib.load(http_tunnel_parser.get_model_path)
+                            
+                        except FileNotFoundError as e:
+                            print(f" Model not found: {e}")
+                            http_tunnel_parser.logger.error(f" Model not found: {e}")
+                            exit(1)
+                        except Exception as e:
+                            print(f" Error loading pipeline: {e}")
+                            http_tunnel_parser.logger.error(f" Error loading pipeline: {e}")
+                            exit(1)
 
-                if y_pred_proba is not None:
-                    # Save probability of "malicious" class (label=1)
-                    extracted_data["malicious_score"] = y_pred_proba[:, 1]
+                        # MAKE PREDICTIONS
 
-                # Filter only malicious sessions
-                threshold = 0.8
-                malicious_sessions = extracted_data[(extracted_data["malicious_score"] > threshold)]
-                #print(f" Found {len(malicious_sessions)} malicious sessions")
+                        http_tunnel_parser.logger.info("Start prediction...")
+                        try:
+                            y_pred = full_pipeline.predict(X_new)
+                            
+                            if hasattr(full_pipeline, 'predict_proba'):
+                                y_pred_proba = full_pipeline.predict_proba(X_new)
+                                print("Prediction probabilities computed")
+                                http_tunnel_parser.logger.info("Prediction probabilities computed")
+                            else:
+                                y_pred_proba = None
+                                print("  Model doesn't support probability predictions")
+                                http_tunnel_parser.logger.error("Model doesn't support probability predictions")
+                        except Exception as e:
+                            print(f" Error during prediction: {e}")
+                            http_tunnel_parser.logger.error(f" Error during prediction: {e}")
+                            exit(1)
 
-               
-                # temporal correlation of alerts by dst IP
-                if malicious_sessions.empty:
-                    print(" No malicious sessions detected, skipping alert generation...")
-                    http_tunnel_parser.logger.info(" No malicious sessions detected, skipping alert generation...")
+                        # Add predictions back to extracted_data
+                        extracted_data=extracted_data.toPandas()
+                        extracted_data = extracted_data.copy()  # to avoid modifying original
+                        extracted_data["prediction"] = y_pred # bydefault threshold 0.5
+
+                        if y_pred_proba is not None:
+                            # Save probability of "malicious" class (label=1)
+                            extracted_data["malicious_score"] = y_pred_proba[:, 1]
+
+                        # Filter only malicious sessions
+                        threshold = 0.8
+                        malicious_sessions = extracted_data[(extracted_data["malicious_score"] > threshold)]
+                        #print(f" Found {len(malicious_sessions)} malicious sessions")
+
+                    
+                        # temporal correlation of alerts by dst IP
+                        if malicious_sessions.empty:
+                            print(" No malicious sessions detected, skipping alert generation...")
+                            http_tunnel_parser.logger.info(" No malicious sessions detected, skipping alert generation...")
+                        else:
+                            print(f" Found {len(malicious_sessions)} malicious sessions before temporal filtering")
+                            http_tunnel_parser.logger.info(f" Found {len(malicious_sessions)} malicious sessions before temporal filtering")
+                            #malicious_sessions = http_tunnel_parser.temporal_correlation(malicious_sessions)
+                            if malicious_sessions.empty:
+                                print(" No malicious sessions detected,after temporal filtering skipping alert generation...")
+                                http_tunnel_parser.logger.info(" No malicious sessions detected,after temporal filtering skipping alert generation...")
+                            else:
+
+                                # Select only the columns I want to display
+                                display_columns = [
+                                    "src_ip","dst_ip","Flow_Bytes_per_s","Total_Fwd_Packets", "Total_Backward_Packets","malicious_score"
+                                ]
+
+                                # Keep only the selected columns (ignore if missing)
+                                malicious_info = malicious_sessions[display_columns].copy()
+
+                                # Print  as a table
+                                print("\n=== Malicious Sessions (summary) ===")
+                                print(malicious_info.to_string(index=False))
+                                http_tunnel_parser.logger.info(malicious_info.to_string(index=False))
+                                #https_c2_parser.logger.info(f" Found {len(malicious_sessions)} malicious sessions.")
+
+                                http_tunnel_parser.make_alertgeneration_http_tunnel(malicious_sessions)
                 else:
-                    print(f" Found {len(malicious_sessions)} malicious sessions before temporal filtering")
-                    http_tunnel_parser.logger.info(f" Found {len(malicious_sessions)} malicious sessions before temporal filtering")
-                    #malicious_sessions = http_tunnel_parser.temporal_correlation(malicious_sessions)
-                    if malicious_sessions.empty:
-                        print(" No malicious sessions detected,after temporal filtering skipping alert generation...")
-                        http_tunnel_parser.logger.info(" No malicious sessions detected,after temporal filtering skipping alert generation...")
-                    else:
+                    http_tunnel_parser.logger.info("No Input Data received, skipping!")
+                    print("No Input Data received, skipping!")
+            finally:
+                # Only delete files after each iteration, don't shutdown Spark
+                if filenames is not None:
+                    http_tunnel_parser.delete_files(filenames)
 
-                        # Select only the columns I want to display
-                        display_columns = [
-                            "src_ip","dst_ip","malicious_score"
-                        ]
-
-                        # Keep only the selected columns (ignore if missing)
-                        malicious_info = malicious_sessions[display_columns].copy()
-
-                        # Print  as a table
-                        print("\n=== Malicious Sessions (summary) ===")
-                        print(malicious_info.to_string(index=False))
-                        http_tunnel_parser.logger.info(malicious_info.to_string(index=False))
-                        #https_c2_parser.logger.info(f" Found {len(malicious_sessions)} malicious sessions.")
-
-                        http_tunnel_parser.make_alertgeneration_http_tunnel(malicious_sessions)
-        else:
-            http_tunnel_parser.logger.info("No Input Data received, skipping!")
-            print("No Input Data received, skipping!")
+            time.sleep(120)
+    
     finally:
+        # Shutdown Spark session only when exiting the entire program
+        http_tunnel_parser.logger.info("shutting down spark...")
         http_tunnel_parser.shutdown_spark_session()
-        if filenames is not None:
             
-            http_tunnel_parser.delete_files(filenames)
             

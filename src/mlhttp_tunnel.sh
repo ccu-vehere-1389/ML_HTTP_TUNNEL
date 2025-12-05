@@ -2,17 +2,14 @@
 CONDA_SCRIPT_FILE="/root/miniconda3/etc/profile.d/conda.sh"
 SPARK_SUBMIT="/usr/local/src/ml-analyzer-v3.2/bin/spark-submit"
 HTTP_TUNNEL_SCRIPT="/usr/local/bin/mlhttp_tunnel/http_tunnel.py"
-HTTP_TUNNEL_PREPROCESSOR_INPUT="/usr/local/bin/mlhttp_tunnel/preproc_http_tunnel_input" #temporary pre-processing directory
-AGGREGATION_TIME_INTERVAL=5m
+HTTP_TUNNEL_RAW_INPUT="/var/log/vehere/dpi/https_c2_input"
+HTTP_TUNNEL_PREPROCESSOR_INPUT="/usr/local/bin/mlhttp_tunnel/preproc_http_tunnel_input" #temporary pre-processing directory here data ready for processing
 alert_input_dir="/usr/local/bin/mlhttp_tunnel/alerts"
 alert_logstash_path="/var/log/vehere/mlhttp_tunnel-alerts"
 
 
-
-#remove all files in temporary pre-processing directory
-rm -f $HTTP_TUNNEL_PREPROCESSOR_INPUT/*
-
 mkdir -p $alert_logstash_path
+
 
 if ls $alert_logstash_path/*.json 1> /dev/null 2>&1; then
     chown logstash:logstash $alert_logstash_path/*.json
@@ -27,23 +24,34 @@ touch $alerts_marker_file
 
 
 
+#remove all files in temporary pre-processing directory
+rm -f $HTTP_TUNNEL_PREPROCESSOR_INPUT/*
+
+
+#Fire Python script for inference and alert generation in the background
+"$SPARK_SUBMIT" \
+    --master local[4] \
+    --conf spark.driver.cores=4 \
+    --conf spark.executor.cores=4 \
+    "$HTTP_TUNNEL_SCRIPT" &
+
 
 
 while true; do
 
-    "$SPARK_SUBMIT" \
-        --master local[4] \
-        --conf spark.driver.cores=4 \
-        --conf spark.executor.cores=4 \
-        "$HTTP_TUNNEL_SCRIPT"
+    # Move every new RAW file immediately (never wait for Spark)
+    if ls "$HTTP_TUNNEL_RAW_INPUT"/*.parquet >/dev/null 2>&1; then
+        mv "$HTTP_TUNNEL_RAW_INPUT"/*.parquet "$HTTP_TUNNEL_PREPROCESSOR_INPUT"/
+        echo "[INFO] Moved RAW → BUFFER"
+    fi
 
-    #"$SPARK_SUBMIT" "$HTTPS_C2_SCRIPT"
-    #python3 $HTTPS_C2_SCRIPT
-    sleep $AGGREGATION_TIME_INTERVAL
+
+    sleep 120s 
     find "$alert_input_dir" -type f -newer "$alerts_marker_file" -exec cp {} "$alert_logstash_path" \;
     find "$alert_input_dir" -name "*.json" -mmin +"$alerts_window_mins" -exec rm -f {} \;
     chown logstash:logstash $alert_logstash_path/*.json
     touch $alerts_marker_file
+
 done
 
 

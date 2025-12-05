@@ -34,7 +34,7 @@ class Http_tunnelConfigLoader:
     def _configure_logging(self):
         """Configure and return a logger using path from config (or fallback to stdout)."""
         logger = logging.getLogger("mlhttp_tunnel")
-        # if already configured, just return existing logger
+        
         if logger.handlers:
             return logger
 
@@ -58,7 +58,7 @@ class Http_tunnelConfigLoader:
             logger.addHandler(handler)
             logger.setLevel(logging.DEBUG)
         else:
-            # fallback to console if no path in config
+            
             logging.basicConfig(
                 level=logging.INFO,
                 format="%(asctime)s - %(levelname)s - %(message)s",
@@ -73,12 +73,6 @@ class Http_tunnelConfigLoader:
             self.logger.error("Cannot extract log file path from a None configuration")
             return None
         return self.config.get('log_file_path')
-
-    def get_raw_input_dir_path(self):
-        if not self.config:
-            self.logger.error("Cannot extract raw_input_dir_path from a None configuration")
-            return None
-        return self.config.get('http_tunnel_raw_input_dir')
 
     def get_preprocessor_dir_path(self):
         if not self.config:
@@ -107,7 +101,6 @@ class Http_tunnelConfigLoader:
     def main(self):
         """Convenience: return the tuple you used before (uses getters)."""
         return (self.get_log_file_path(),
-                self.get_raw_input_dir_path(),
                 self.get_preprocessor_dir_path(),
                 self.get_model_path(),
                 self.get_threshold(),

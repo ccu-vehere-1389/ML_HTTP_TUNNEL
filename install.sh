@@ -36,6 +36,7 @@ chmod +x $bin_path/*.sh
 chmod 755 $config_path/http_tunnel_config.json
 chmod 777 $service_path/mlhttp_tunnel.service
 
+echo -e "updating service...\n"
 
 systemctl daemon-reload
 systemctl enable mlhttp_tunnel.service
